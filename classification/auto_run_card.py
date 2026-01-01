@@ -175,6 +175,7 @@ if __name__ == "__main__":
     with open(summary_txt_path, "w") as f:
         f.write(f"Experiment Report: {args.dataset}\n")
         f.write(f"Best Params: {best_params}\n")
+        f.write(f"Best Search Imp: {best_record['imp']:.4%}\n")
         f.write("-" * 60 + "\n")
         f.write(f"{'Run':<5} | {'Cheby':<8} | {'Clark':<8} | {'Canbe':<8} | {'KL':<8} | {'Cosine':<8} | {'Inter':<8}\n")
 

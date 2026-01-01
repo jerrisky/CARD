@@ -334,7 +334,7 @@ def main(input_args=None):
     except Exception:
         logging.error(traceback.format_exc())
 
-    return 0
+    return best_metric
 
 
 if __name__ == "__main__":
