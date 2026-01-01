@@ -133,14 +133,16 @@ parser.add_argument("--sequence", action="store_true")
 parser.add_argument(
     "--loss", type=str, default='ddpm', help="loss function"
 )
-
+parser.add_argument(
+    "--model_dir", type=str, default="model", 
+    help="Root directory for saving checkpoints (e.g., 'model' or 'temp_model')"
+)
 parser.add_argument(
     "--num_sample", type=int, default=1, help="number of samples used in forward and reverse"
 )
+parser.add_argument("--tune", action="store_true", help="Run 5-Fold Cross Validation for Hyperparameter Tuning")
 
-args = parser.parse_args()
-
-
+args = None
 def parse_config():
     args.log_path = os.path.join(args.exp, "logs", args.doc)
 
@@ -217,6 +219,8 @@ def parse_config():
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
         logger = logging.getLogger()
+        while logger.handlers:
+            logger.removeHandler(logger.handlers[0])
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -239,6 +243,8 @@ def parse_config():
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
         logger = logging.getLogger()
+        while logger.handlers:
+            logger.removeHandler(logger.handlers[0])
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -274,7 +280,12 @@ def dict2namespace(config):
     return namespace
 
 
-def main():
+def main(input_args=None):
+    global args
+    if input_args is not None:
+        args = input_args
+    else:
+        args = parser.parse_args()
     config, logger = parse_config()
     logging.info("Writing log file to {}".format(args.log_path))
     logging.info("Exp instance id = {}".format(os.getpid()))
@@ -289,7 +300,13 @@ def main():
         runner = Diffusion(args, config, device=config.device)
         start_time = time.time()
         procedure = None
-        if args.sample:
+        best_metric = None
+        if args.tune:
+            # Phase 1: Search
+            best_metric = runner.tune()
+            procedure = "Tuning (5-Fold)"
+            return best_metric
+        elif args.sample:
             runner.sample()
             procedure = "Sampling"
         elif args.test:
@@ -299,11 +316,13 @@ def main():
                 y_majority_vote_accuracy_all_steps_list = runner.test()
             procedure = "Testing"
         else:
-            runner.train()
+            best_metric = runner.train()
             procedure = "Training"
         end_time = time.time()
         logging.info("\n{} procedure finished. It took {:.4f} minutes.\n\n\n".format(
             procedure, (end_time - start_time) / 60))
+        if best_metric is not None:
+            print(f"[SEARCH_METRIC_AVG_IMP]: {best_metric}")
         # remove logging handlers
         handlers = logger.handlers[:]
         for handler in handlers:
@@ -319,6 +338,7 @@ def main():
 
 
 if __name__ == "__main__":
+    args = parser.parse_args()
     args.doc = args.doc + "/split_" + str(args.split)
     if args.test:
         args.config = args.config + args.doc + "/config.yml"

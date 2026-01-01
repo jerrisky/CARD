@@ -6,7 +6,9 @@ import numpy as np
 import scipy.stats as stats
 from torch.utils.data import TensorDataset
 from sklearn.preprocessing import StandardScaler
-
+from torch.utils.data import Dataset
+import numpy as np
+import logging
 
 class Gaussians:
     """
@@ -211,6 +213,53 @@ class AddGaussianNoise(object):
     def __repr__(self):
         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
+class LDL_Feature_Dataset(Dataset):
+    def __init__(self, config, mode='train'):
+        # 支持的12个数据集名称
+        valid_datasets = [
+            "SBU_3DFE", "Scene", "Gene", "Movie", "RAF_ML", "Ren_Cecps", 
+            "SJAFFE", "M2B", "SCUT_FBP5500", "Twitter_LDL", "Flickr_LDL", "SCUT_FBP"
+        ]
+        
+        dataset_name = config.data.dataset
+        run_idx = getattr(config.data, 'run_idx', 0)
+        
+        root_dir = os.path.join('../../Data', 'feature', dataset_name, f'run_{run_idx}')
+        
+        if not os.path.exists(root_dir):
+            alt_dir = os.path.join('../../Data', 'image', dataset_name, f'run_{run_idx}')
+            if os.path.exists(alt_dir):
+                root_dir = alt_dir
+            else:
+                raise FileNotFoundError(
+                    f"Data not found.\nChecked:\n1. {root_dir}\n2. {alt_dir}\n"
+                    f"Current working dir: {os.getcwd()}"
+                )
+
+        self.feature_path = os.path.join(root_dir, f'{mode}_feature.npy')
+        self.label_path = os.path.join(root_dir, f'{mode}_label.npy')
+        
+        logging.info(f"[{mode.upper()}] Loading {dataset_name} from {self.feature_path}")
+        
+        self.features = np.load(self.feature_path).astype(np.float32)
+        self.labels = np.load(self.label_path).astype(np.float32)
+        
+        self.features = torch.from_numpy(self.features)
+        self.labels = torch.from_numpy(self.labels)
+
+    def __getitem__(self, index):
+        return self.features[index], self.labels[index]
+
+    def __len__(self):
+        return len(self.features)
+
+    @property
+    def feature_dim(self):
+        return self.features.shape[1]
+        
+    @property
+    def label_dim(self):
+        return self.labels.shape[1]
 
 if __name__ == '__main__':
     if not os.path.exists('./data'):

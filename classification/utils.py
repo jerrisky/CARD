@@ -95,6 +95,17 @@ def adjust_learning_rate(optimizer, epoch, config):
 
 def get_dataset(args, config):
     data_object = None
+    ldl_datasets = [
+        "SBU_3DFE", "Scene", "Gene", "Movie", "RAF_ML", "Ren_Cecps", 
+        "SJAFFE", "M2B", "SCUT_FBP5500", "Twitter_LDL", "Flickr_LDL", "SCUT_FBP"
+    ]
+    if config.data.dataset in ldl_datasets:
+        # 局部引用避免循环依赖
+        from data_loader import LDL_Feature_Dataset
+        train_dataset = LDL_Feature_Dataset(config, mode='train')
+        test_dataset = LDL_Feature_Dataset(config, mode='test')
+        # 对于特征数据，data_object (用于归一化等) 可以暂设为 None，或者根据需要实现
+        return None, train_dataset, test_dataset
     if config.data.dataset == 'toy':
         tr_x, tr_y = Gaussians().sample(config.data.dataset_size)
         te_x, te_y = Gaussians().sample(config.data.dataset_size)

@@ -59,6 +59,14 @@ class ConditionalModel(nn.Module):
                 self.encoder_x = LeNet5(feature_dim, config.model.n_input_channels, config.model.n_input_padding)
             else:
                 self.encoder_x = FashionCNN(out_dim=feature_dim)
+        elif config.data.dataset in ["Gene", "Movie", "RAF_ML", "Ren_Cecps", 
+                                      "SBU_3DFE", "Scene", "Flickr_LDL", 
+                                      "M2B", "SCUT_FBP", "SCUT_FBP5500", 
+                                      "SJAFFE", "Twitter_LDL"]:
+            if data_dim != feature_dim:
+                self.encoder_x = nn.Linear(data_dim, feature_dim)
+            else:
+                self.encoder_x = nn.Identity()
         else:
             self.encoder_x = ResNetEncoder(arch=arch, feature_dim=feature_dim)
         # batch norm layer

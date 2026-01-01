@@ -1,9 +1,8 @@
 import logging
 import time
 import gc
-
 import matplotlib.pyplot as plt
-import statsmodels.api as sm
+# import statsmodels.api as sm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,14 +16,37 @@ from pretraining.encoder import Model as AuxCls
 from pretraining.resnet import ResNet18
 from utils import *
 from diffusion_utils import *
-
+import json  # 新增
+import metrics
 plt.style.use('ggplot')
-
-
+import torch
+import torch.multiprocessing
+from sklearn.model_selection import KFold
+from torch.utils.data import Subset
+torch.multiprocessing.set_sharing_strategy('file_system')
+def calc_avg_improvement(current_scores, sota_scores):
+    improvements = []
+    # 0-3: 越小越好 (SOTA - Ours) / SOTA
+    for i in range(4):
+        val = current_scores[i]
+        ref = sota_scores[i]
+        imp = (ref - val) / (ref + 1e-8)
+        improvements.append(imp)
+    
+    # 4-5: 越大越好 (Ours - SOTA) / SOTA
+    for i in range(4, 6):
+        val = current_scores[i]
+        ref = sota_scores[i]
+        imp = (val - ref) / (ref + 1e-8)
+        improvements.append(imp)
+        
+    return np.mean(improvements)
 class Diffusion(object):
     def __init__(self, args, config, device=None):
         self.args = args
         self.config = config
+        self.ldl_datasets = ["SBU_3DFE", "Scene", "Gene", "Movie", "RAF_ML", "Ren_Cecps", 
+                             "SJAFFE", "M2B", "SCUT_FBP5500", "Twitter_LDL", "Flickr_LDL", "SCUT_FBP"]
         if device is None:
             device = (
                 torch.device("cuda")
@@ -32,7 +54,7 @@ class Diffusion(object):
                 else torch.device("cpu")
             )
         self.device = device
-
+        self.model_save_root = getattr(args, 'model_dir', 'model')
         self.model_var_type = config.model.var_type
         self.num_timesteps = config.diffusion.timesteps
         self.vis_step = config.diffusion.vis_step
@@ -104,17 +126,63 @@ class Diffusion(object):
                 elif config.diffusion.aux_cls.arch == "resnet18_ckpt":
                     # self.cond_pred_model = resnet18(pretrained=False).to(self.device)
                     self.cond_pred_model = ResNet18(num_classes=config.data.num_classes).to(self.device)
+                elif config.data.dataset in self.ldl_datasets:
+                    self.cond_pred_model = nn.Sequential(
+                        nn.Linear(config.model.data_dim, config.model.hidden_dim),
+                        nn.BatchNorm1d(config.model.hidden_dim),
+                        nn.ReLU(),
+                        nn.Linear(config.model.hidden_dim, config.model.hidden_dim),
+                        nn.BatchNorm1d(config.model.hidden_dim),
+                        nn.ReLU(),
+                        nn.Linear(config.model.hidden_dim, config.data.num_classes)
+                    ).to(self.device)
+                    logging.info(f"Initialized MLP Guidance Model for LDL: {config.model.data_dim} -> {config.model.hidden_dim} -> {config.data.num_classes}")
                 else:
                     self.cond_pred_model = AuxCls(config).to(self.device)
+            elif config.data.dataset in self.ldl_datasets:
+                self.cond_pred_model = nn.Sequential(
+                    nn.Linear(config.model.data_dim, config.model.hidden_dim),
+                    nn.BatchNorm1d(config.model.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(config.model.hidden_dim, config.model.hidden_dim),
+                    nn.BatchNorm1d(config.model.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(config.model.hidden_dim, config.data.num_classes)
+                ).to(self.device)
+                logging.info(f"Initialized MLP Guidance Model for LDL Task.")
             else:
                 self.cond_pred_model = AuxCls(config).to(self.device)
-            self.aux_cost_function = nn.CrossEntropyLoss()
+            if config.data.dataset in self.ldl_datasets:
+                logging.info("LDL Task: Using Raw MSELoss (No Softmax constraints)")
+                self.aux_cost_function = nn.MSELoss()
+            else:
+                self.aux_cost_function = nn.CrossEntropyLoss()
         else:
             pass
 
         # scaling temperature for NLL and ECE computation
-        self.tuned_scale_T = None
+        self.sota_values = None
+        sota_json_path = '../../Data/sota.json'
+        self.metrics_keys = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
 
+        if os.path.exists(sota_json_path):
+            try:
+                with open(sota_json_path, 'r', encoding='utf-8') as f:
+                    full_json = json.load(f)
+                    sota_data = full_json.get('data', {})
+                
+                key = config.data.dataset
+                if key in sota_data:
+                    # 按照 metrics_keys 的顺序提取 mean 值
+                    self.sota_values = [sota_data[key][k]['mean'] for k in self.metrics_keys]
+                    logging.info(f"Loaded SOTA for {key}: {self.sota_values}")
+                else:
+                    logging.warning(f"Dataset {key} not found in sota.json")
+            except Exception as e:
+                logging.warning(f"Failed to load SOTA: {e}")
+        else:
+            logging.warning(f"SOTA file not found at {sota_json_path}")
+        self.tuned_scale_T = None
     # Compute guiding prediction as diffusion condition
     def compute_guiding_prediction(self, x):
         """
@@ -159,12 +227,460 @@ class Diffusion(object):
         aux_cost.backward()
         aux_optimizer.step()
         return aux_cost.cpu().item()
+    def tune(self):
+        logging.info(">>> Starting Internal 5-Fold Tuning (Minimal Mode)...")
+        args = self.args
+        config = self.config
+        tb_logger = self.config.tb_logger
+        config.data.run_idx = 0 
+        data_object, full_train_dataset, _ = get_dataset(args, config)
+        real_data_dim = getattr(full_train_dataset, 'feature_dim', config.model.data_dim)
+        real_num_classes = getattr(full_train_dataset, 'label_dim', config.data.num_classes)
+        train_size = len(full_train_dataset)
+        kfold = KFold(n_splits=5, shuffle=True, random_state=config.data.seed)
+        fold_imps = []
 
+        # 强制更新 Config，确保模型使用真实的数据维度
+        config.model.data_dim = real_data_dim
+        config.data.num_classes = real_num_classes
+        
+        logging.info(f"Dataset Loaded. Samples: {train_size}. Feature Dim: {real_data_dim}")
+        for fold, (train_ids, val_ids) in enumerate(kfold.split(full_train_dataset)):
+            logging.info(f"\n--- Tuning Fold {fold+1} / 5 ---")
+            # (A) 准备数据 (切分)
+            train_sub = Subset(full_train_dataset, train_ids)
+            val_sub = Subset(full_train_dataset, val_ids)
+            train_loader = data.DataLoader(train_sub, batch_size=config.training.batch_size, shuffle=True, num_workers=config.data.num_workers)
+            test_loader = data.DataLoader(val_sub, batch_size=config.testing.batch_size, shuffle=False, num_workers=config.data.num_workers)
+            if config.diffusion.apply_aux_cls and config.data.dataset in self.ldl_datasets:
+                self.cond_pred_model = nn.Sequential(
+                    nn.Linear(config.model.data_dim, config.model.hidden_dim),
+                    nn.BatchNorm1d(config.model.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(config.model.hidden_dim, config.model.hidden_dim),
+                    nn.BatchNorm1d(config.model.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(config.model.hidden_dim, config.data.num_classes)
+                ).to(self.device)
+                logging.info(f"Guidance Model (MLP) Re-initialized: [{real_data_dim}] -> [{config.model.hidden_dim}] -> [{real_num_classes}]")
+            # ================================================================
+            model = ConditionalModel(config, guidance=config.diffusion.include_guidance)
+            model = model.to(self.device)
+            
+            if self.config.data.dataset not in self.ldl_datasets:
+                # 原版逻辑 (CIFAR/MNIST 等) 保留
+                y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+                logging.info("\nBefore training, the guidance classifier accuracy on the test set is {:.8f}.\n\n".format(
+                    y_acc_aux_model))
+            else:
+                # LDL 逻辑：跳过计算，打印一条提示即可
+                logging.info("\n[LDL Task] Skipping initial accuracy check (Metric incompatibility).\n")
+
+            optimizer = get_optimizer(self.config.optim, model.parameters())
+            criterion = nn.CrossEntropyLoss()
+            brier_score = nn.MSELoss()
+
+            # apply an auxiliary optimizer for the guidance classifier
+            if config.diffusion.apply_aux_cls:
+                aux_optimizer = get_optimizer(self.config.aux_optim,
+                                            self.cond_pred_model.parameters())
+
+            if self.config.model.ema:
+                ema_helper = EMA(mu=self.config.model.ema_rate)
+                ema_helper.register(model)
+            else:
+                ema_helper = None
+
+            if config.diffusion.apply_aux_cls:
+                if hasattr(config.diffusion, "trained_aux_cls_ckpt_path") and config.diffusion.trained_aux_cls_ckpt_path:
+                    aux_states = torch.load(os.path.join(config.diffusion.trained_aux_cls_ckpt_path,
+                                                        config.diffusion.trained_aux_cls_ckpt_name),
+                                            map_location=self.device)
+                    self.cond_pred_model.load_state_dict(aux_states['state_dict'], strict=True)
+                    self.cond_pred_model.eval()
+                elif hasattr(config.diffusion, "trained_aux_cls_log_path"):
+                    aux_states = torch.load(os.path.join(config.diffusion.trained_aux_cls_log_path, "aux_ckpt.pth"),
+                                            map_location=self.device)
+                    self.cond_pred_model.load_state_dict(aux_states[0], strict=True)
+                    self.cond_pred_model.eval()
+                else:  # pre-train the guidance auxiliary classifier
+                    assert config.diffusion.aux_cls.pre_train
+                    self.cond_pred_model.train()
+                    pretrain_start_time = time.time()
+                    for epoch in range(config.diffusion.aux_cls.n_pretrain_epochs):
+                        for feature_label_set in train_loader:
+                            if config.data.dataset == "gaussian_mixture":
+                                x_batch, y_one_hot_batch, y_logits_batch, y_labels_batch = feature_label_set
+                            # [新增] LDL 分支：直接读取，不做 One-hot 转换
+                            elif config.data.dataset in self.ldl_datasets:
+                                x_batch, y_labels_batch = feature_label_set
+                                    # 这一步很关键：直接把真实的分布标签赋值给 y_one_hot_batch
+                                y_one_hot_batch = y_labels_batch.to(self.device)
+                                y_logits_batch = None # LDL 不需要这个
+                            else:
+                                x_batch, y_labels_batch = feature_label_set
+                                y_one_hot_batch, y_logits_batch = cast_label_to_one_hot_and_prototype(y_labels_batch,
+                                                                                                    config)
+                            aux_loss = self.nonlinear_guidance_model_train_step(x_batch.to(self.device),
+                                                                                y_one_hot_batch.to(self.device),
+                                                                                aux_optimizer)
+                        if epoch % config.diffusion.aux_cls.logging_interval == 0:
+                            logging.info(
+                                f"epoch: {epoch}, guidance auxiliary classifier pre-training loss: {aux_loss}"
+                            )
+                    pretrain_end_time = time.time()
+                    logging.info("\nPre-training of guidance auxiliary classifier took {:.4f} minutes.\n".format(
+                        (pretrain_end_time - pretrain_start_time) / 60))
+                    # save auxiliary model after pre-training
+                    aux_states = [
+                        self.cond_pred_model.state_dict(),
+                        aux_optimizer.state_dict(),
+                    ]
+                    torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
+                # report accuracy on both training and test set for the pre-trained auxiliary classifier
+                if config.data.dataset not in self.ldl_datasets:
+                    y_acc_aux_model = self.evaluate_guidance_model(train_loader)
+                    logging.info("\nAfter pre-training, accuracy on training set: {:.8f}.".format(y_acc_aux_model))
+                    y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+                    logging.info("\nAfter pre-training, accuracy on test set: {:.8f}.\n".format(y_acc_aux_model))
+                else:
+                    logging.info("\n[LDL Task] Pre-training finished. Skipping accuracy report.\n")
+
+            if not self.args.train_guidance_only:
+                start_epoch, step = 0, 0
+                if self.args.resume_training:
+                    states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"),
+                                        map_location=self.device)
+                    model.load_state_dict(states[0])
+
+                    states[1]["param_groups"][0]["eps"] = self.config.optim.eps
+                    optimizer.load_state_dict(states[1])
+                    start_epoch = states[2]
+                    step = states[3]
+                    if self.config.model.ema:
+                        ema_helper.load_state_dict(states[4])
+                    # load auxiliary model
+                    has_ckpt = hasattr(config.diffusion, "trained_aux_cls_ckpt_path") and config.diffusion.trained_aux_cls_ckpt_path
+                    has_log = hasattr(config.diffusion, "trained_aux_cls_log_path") and config.diffusion.trained_aux_cls_log_path
+                    
+                    if config.diffusion.apply_aux_cls and (not has_ckpt) and (not has_log):
+                        aux_states = torch.load(os.path.join(self.args.log_path, "aux_ckpt.pth"),
+                                                map_location=self.device)
+                        self.cond_pred_model.load_state_dict(aux_states[0])
+                        aux_optimizer.load_state_dict(aux_states[1])
+
+                max_accuracy = 0.0
+                best_avg_imp = -float('inf')
+                if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
+                    logging.info("Prior distribution at timestep T has a mean of 0.")
+                if args.add_ce_loss:
+                    logging.info("Apply cross entropy as an auxiliary loss during training.")
+                for epoch in range(start_epoch, self.config.training.n_epochs):
+                    data_start = time.time()
+                    data_time = 0
+                    for i, feature_label_set in enumerate(train_loader):
+                        if config.data.dataset == "gaussian_mixture":
+                            x_batch, y_one_hot_batch, y_logits_batch, y_labels_batch = feature_label_set
+                        elif config.data.dataset in self.ldl_datasets:
+                            x_batch, y_labels_batch = feature_label_set
+                            y_one_hot_batch = y_labels_batch.to(self.device) # 分布本身就是目标
+                            y_logits_batch = None # 不需要 Logits
+                        else:
+                            x_batch, y_labels_batch = feature_label_set
+                            y_one_hot_batch, y_logits_batch = cast_label_to_one_hot_and_prototype(y_labels_batch, config)
+                            # y_labels_batch = y_labels_batch.reshape(-1, 1)
+                        if config.optim.lr_schedule:
+                            adjust_learning_rate(optimizer, i / len(train_loader) + epoch, config)
+                        n = x_batch.size(0)
+                        # record unflattened x as input to guidance aux classifier
+                        x_unflat_batch = x_batch.to(self.device)
+                        if config.data.dataset == "toy" or config.model.arch in ["simple", "linear"]:
+                            x_batch = torch.flatten(x_batch, 1)
+                        data_time += time.time() - data_start
+                        model.train()
+                        self.cond_pred_model.eval()
+                        step += 1
+
+                        # antithetic sampling
+                        t = torch.randint(
+                            low=0, high=self.num_timesteps, size=(n // 2 + 1,)
+                        ).to(self.device)
+                        t = torch.cat([t, self.num_timesteps - 1 - t], dim=0)[:n]
+
+                        # noise estimation loss
+                        x_batch = x_batch.to(self.device)
+                        # y_0_batch = y_logits_batch.to(self.device)
+                        if config.data.dataset in self.ldl_datasets:
+                            y_0_hat_batch = self.compute_guiding_prediction(x_unflat_batch)
+                        else:
+                            y_0_hat_batch = self.compute_guiding_prediction(x_unflat_batch).softmax(dim=1)
+                        y_T_mean = y_0_hat_batch
+                        if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
+                            y_T_mean = torch.zeros(y_0_hat_batch.shape).to(y_0_hat_batch.device)
+                        y_0_batch = y_one_hot_batch.to(self.device)
+                        e = torch.randn_like(y_0_batch).to(y_0_batch.device)
+                        y_t_batch = q_sample(y_0_batch, y_T_mean,
+                                            self.alphas_bar_sqrt, self.one_minus_alphas_bar_sqrt, t, noise=e)
+                        # output = model(x_batch, y_t_batch, t, y_T_mean)
+                        output = model(x_batch, y_t_batch, t, y_0_hat_batch)
+                        loss = (e - output).square().mean()  # use the same noise sample e during training to compute loss
+
+                        # cross-entropy for y_0 reparameterization
+                        loss0 = torch.tensor([0])
+                        if args.add_ce_loss:
+                            y_0_reparam_batch = y_0_reparam(model, x_batch, y_t_batch, y_0_hat_batch, y_T_mean, t,
+                                                            self.one_minus_alphas_bar_sqrt)
+                            raw_prob_batch = -(y_0_reparam_batch - 1) ** 2
+                            loss0 = criterion(raw_prob_batch, y_labels_batch.to(self.device))
+                            loss += config.training.lambda_ce * loss0
+
+                        if not tb_logger is None:
+                            tb_logger.add_scalar("loss", loss, global_step=step)
+
+                        if step % self.config.training.logging_freq == 0 or step == 1:
+                            logging.info(
+                                (
+                                        f"epoch: {epoch}, step: {step}, CE loss: {loss0.item()}, "
+                                        f"Noise Estimation loss: {loss.item()}, " +
+                                        f"data time: {data_time / (i + 1)}"
+                                )
+                            )
+
+                        # optimize diffusion model that predicts eps_theta
+                        optimizer.zero_grad()
+                        loss.backward()
+                        try:
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), config.optim.grad_clip
+                            )
+                        except Exception:
+                            pass
+                        optimizer.step()
+                        if self.config.model.ema:
+                            ema_helper.update(model)
+
+                        # joint train aux classifier along with diffusion model
+                        if config.diffusion.apply_aux_cls and config.diffusion.aux_cls.joint_train:
+                            self.cond_pred_model.train()
+                            aux_loss = self.nonlinear_guidance_model_train_step(x_unflat_batch, y_one_hot_batch,
+                                                                                aux_optimizer)
+                            if step % self.config.training.logging_freq == 0 or step == 1:
+                                logging.info(
+                                    f"meanwhile, guidance auxiliary classifier joint-training loss: {aux_loss}"
+                                )
+
+                        # save diffusion model
+                        if step % self.config.training.snapshot_freq == 0 or step == 1:
+                            states = [
+                                model.state_dict(),
+                                optimizer.state_dict(),
+                                epoch,
+                                step,
+                            ]
+                            if self.config.model.ema:
+                                states.append(ema_helper.state_dict())
+
+                            if step > 1:  # skip saving the initial ckpt
+                                torch.save(
+                                    states,
+                                    os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
+                                )
+                            # save current states
+                            torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+
+                            # save auxiliary model
+                            if config.diffusion.apply_aux_cls and config.diffusion.aux_cls.joint_train:
+                                aux_states = [
+                                    self.cond_pred_model.state_dict(),
+                                    aux_optimizer.state_dict(),
+                                ]
+                                if step > 1:  # skip saving the initial ckpt
+                                    torch.save(
+                                        aux_states,
+                                        os.path.join(self.args.log_path, "aux_ckpt_{}.pth".format(step)),
+                                    )
+                                torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
+
+                        data_start = time.time()
+
+                    logging.info(
+                        (f"epoch: {epoch}, step: {step}, CE loss: {loss0.item()}, Noise Estimation loss: {loss.item()}, " +
+                        f"data time: {data_time / (i + 1)}")
+                    )
+
+                    # Evaluate
+                    if epoch % self.config.training.validation_freq == 0 \
+                            or epoch + 1 == self.config.training.n_epochs:
+                        if config.data.dataset in self.ldl_datasets:
+                            # 验证阶段只跑 1 次，为了快
+                            current_scores = self.test_ldl_task(model, test_loader, n_repeat=1)
+                            current_imp = calc_avg_improvement(current_scores, self.sota_values)
+                            
+                            logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.4f}")
+                            
+                            if current_imp > best_avg_imp:
+                                best_avg_imp = current_imp
+                        elif config.data.dataset == "toy":
+                            with torch.no_grad():
+                                model.eval()
+                                label_vec = nn.functional.one_hot(test_dataset[:][1]).float().to(self.device)
+                                # prior mean at timestep T
+                                test_y_0_hat = self.compute_guiding_prediction(
+                                    test_dataset[:][0].to(self.device)).softmax(dim=1)
+                                y_T_mean = test_y_0_hat
+                                if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
+                                    y_T_mean = torch.zeros(test_y_0_hat.shape).to(test_y_0_hat.device)
+                                if epoch == start_epoch:
+                                    fig, axs = plt.subplots(1, self.num_figs,
+                                                            figsize=(self.num_figs * 8.5, 8.5), clear=True)
+                                    for i in range(self.num_figs - 1):
+                                        cur_y = q_sample(label_vec.cpu(), y_T_mean.cpu(),
+                                                        self.alphas_bar_sqrt.cpu(),
+                                                        self.one_minus_alphas_bar_sqrt.cpu(),
+                                                        torch.tensor([i * self.vis_step])).detach().cpu()
+                                        axs[i].scatter(cur_y[:, 0], cur_y[:, 1], s=10, c=test_dataset[:][1]);
+                                        axs[i].set_title('$q(\mathbf{y}_{' + str(i * self.vis_step) + '})$', fontsize=25)
+                                    cur_y = q_sample(label_vec.cpu(), y_T_mean.cpu(),
+                                                    self.alphas_bar_sqrt.cpu(),
+                                                    self.one_minus_alphas_bar_sqrt.cpu(),
+                                                    torch.tensor([self.num_timesteps - 1])).detach().cpu()
+                                    axs[self.num_figs - 1].scatter(cur_y[:, 0], cur_y[:, 1], s=10, c=test_dataset[:][1]);
+                                    axs[self.num_figs - 1].set_title(
+                                        '$q(\mathbf{y}_{' + str(self.num_timesteps - 1) + '})$', fontsize=25)
+                                    if not tb_logger is None:
+                                        tb_logger.add_figure('data', fig, step)
+                                y_seq = p_sample_loop(model, test_dataset[:][0].to(self.device),
+                                                    test_y_0_hat, y_T_mean,
+                                                    self.num_timesteps, self.alphas, self.one_minus_alphas_bar_sqrt,
+                                                    only_last_sample=False)
+                                fig, axs = plt.subplots(1, self.num_figs,
+                                                        figsize=(self.num_figs * 8.5, 8.5), clear=True)
+                                cur_y = y_seq[0].detach().cpu()
+                                axs[self.num_figs - 1].scatter(cur_y[:, 0], cur_y[:, 1], s=10, c=test_dataset[:][1]);
+                                axs[self.num_figs - 1].set_title('$p({y}_\mathbf{prior})$', fontsize=25)
+                                for i in range(self.num_figs - 1):
+                                    cur_y = y_seq[self.num_timesteps - i * self.vis_step - 1].detach().cpu()
+                                    axs[i].scatter(cur_y[:, 0], cur_y[:, 1], s=10, c=test_dataset[:][1]);
+                                    axs[i].set_title('$p(\mathbf{x}_{' + str(self.vis_step * i) + '})$', fontsize=25)
+                                acc_avg = accuracy(y_seq[-1].detach().cpu(), test_dataset[:][1].cpu())[0]
+                                logging.info(
+                                    (f"epoch: {epoch}, step: {step}, Average accuracy: {acc_avg}%")
+                                )
+                                if not tb_logger is None:
+                                    tb_logger.add_figure('samples', fig, step)
+                                    tb_logger.add_scalar('accuracy', acc_avg.item(), global_step=step)
+                                fig.savefig(
+                                    os.path.join(args.im_path, 'samples_T{}_{}.pdf'.format(self.num_timesteps, step)))
+                                plt.close()
+                        else:
+                            model.eval()
+                            self.cond_pred_model.eval()
+                            acc_avg = 0.
+                            for test_batch_idx, (images, target) in enumerate(test_loader):
+                                images_unflat = images.to(self.device)
+                                if config.data.dataset == "toy" \
+                                        or config.model.arch == "simple" \
+                                        or config.model.arch == "linear":
+                                    images = torch.flatten(images, 1)
+                                images = images.to(self.device)
+                                target = target.to(self.device)
+                                # target_vec = nn.functional.one_hot(target).float().to(self.device)
+                                with torch.no_grad():
+                                    target_pred = self.compute_guiding_prediction(images_unflat).softmax(dim=1)
+                                    # prior mean at timestep T
+                                    y_T_mean = target_pred
+                                    if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
+                                        y_T_mean = torch.zeros(target_pred.shape).to(target_pred.device)
+                                    if not config.diffusion.noise_prior:  # apply f_phi(x) instead of 0 as prior mean
+                                        target_pred = self.compute_guiding_prediction(images_unflat).softmax(dim=1)
+                                    label_t_0 = p_sample_loop(model, images, target_pred, y_T_mean,
+                                                            self.num_timesteps, self.alphas,
+                                                            self.one_minus_alphas_bar_sqrt,
+                                                            only_last_sample=True)
+                                    acc_avg += accuracy(label_t_0.detach().cpu(), target.cpu())[0].item()
+                            acc_avg /= (test_batch_idx + 1)
+                            if acc_avg > max_accuracy:
+                                logging.info("Update best accuracy at Epoch {}.".format(epoch))
+                                torch.save(states, os.path.join(self.args.log_path, "ckpt_best.pth"))
+                            max_accuracy = max(max_accuracy, acc_avg)
+                            if not tb_logger is None:
+                                tb_logger.add_scalar('accuracy', acc_avg, global_step=step)
+                            logging.info(
+                                (
+                                        f"epoch: {epoch}, step: {step}, " +
+                                        f"Average accuracy: {acc_avg}, " +
+                                        f"Max accuracy: {max_accuracy:.2f}%"
+                                )
+                            )
+                if self.config.model.ema:
+                    states.append(ema_helper.state_dict())
+                torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
+                # save auxiliary model after training is finished
+                if config.diffusion.apply_aux_cls and config.diffusion.aux_cls.joint_train:
+                    aux_states = [
+                        self.cond_pred_model.state_dict(),
+                        aux_optimizer.state_dict(),
+                    ]
+                    torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
+                    # report training set accuracy if applied joint training
+                    if config.data.dataset not in self.ldl_datasets:
+                        y_acc_aux_model = self.evaluate_guidance_model(train_loader)
+                        logging.info("After joint-training, acc: {:.8f}.".format(y_acc_aux_model))
+                        y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+                        logging.info("After joint-training, test acc: {:.8f}.".format(y_acc_aux_model))
+                final_ensemble_imp = best_avg_imp 
+            logging.info(f"Fold {fold+1} Finished. Best Imp: {best_avg_imp:.2%}")
+            fold_imps.append(final_ensemble_imp)
+        avg_imp = np.mean(fold_imps)
+        print(f"[SEARCH_RESULT_START]")
+        print(f"AVG_IMP: {avg_imp}")
+        print(f"[SEARCH_RESULT_END]")
+        return avg_imp
     def train(self):
         args = self.args
         config = self.config
         tb_logger = self.config.tb_logger
         data_object, train_dataset, test_dataset = get_dataset(args, config)
+        
+        # ================= [新增] 详细的数据维度打印逻辑 =================
+        # 获取维度信息 (优先从 dataset 属性读取，否则用 config 默认值)
+        real_data_dim = getattr(train_dataset, 'feature_dim', config.model.data_dim)
+        real_num_classes = getattr(train_dataset, 'label_dim', config.data.num_classes)
+        train_size = len(train_dataset)
+        test_size = len(test_dataset)
+
+        # 强制更新 Config，确保模型使用真实的数据维度
+        config.model.data_dim = real_data_dim
+        config.data.num_classes = real_num_classes
+        
+        # 组装要打印的报告信息
+        data_report = (
+            f"\n{'='*20} DATASET INTEGRITY CHECK {'='*20}\n"
+            f"Dataset      : {config.data.dataset}\n"
+            f"Data Source  : .npy feature file\n"
+            f"--------------------------------------------\n"
+            f"Train Samples: {train_size}\n"
+            f"Test Samples : {test_size}\n"
+            f"Feature Dim  : {real_data_dim} (Input)\n"
+            f"Label Dim    : {real_num_classes} (Output)\n"
+            f"{'='*63}\n"
+        )
+        # 打印到日志文件开头
+        logging.info(data_report)
+        
+        # 重新初始化引导模型 (MLP)，确保它匹配新的维度
+        if config.diffusion.apply_aux_cls and config.data.dataset in self.ldl_datasets:
+            self.cond_pred_model = nn.Sequential(
+                nn.Linear(config.model.data_dim, config.model.hidden_dim),
+                nn.BatchNorm1d(config.model.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.model.hidden_dim, config.model.hidden_dim),
+                nn.BatchNorm1d(config.model.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.model.hidden_dim, config.data.num_classes)
+            ).to(self.device)
+            logging.info(f"Guidance Model (MLP) Re-initialized: [{real_data_dim}] -> [{config.model.hidden_dim}] -> [{real_num_classes}]")
+        # ================================================================
         train_loader = data.DataLoader(
             train_dataset,
             batch_size=config.training.batch_size,
@@ -179,9 +695,14 @@ class Diffusion(object):
         )
         model = ConditionalModel(config, guidance=config.diffusion.include_guidance)
         model = model.to(self.device)
-        y_acc_aux_model = self.evaluate_guidance_model(test_loader)
-        logging.info("\nBefore training, the guidance classifier accuracy on the test set is {:.8f}.\n\n".format(
-            y_acc_aux_model))
+        if self.config.data.dataset not in self.ldl_datasets:
+            # 原版逻辑 (CIFAR/MNIST 等) 保留
+            y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+            logging.info("\nBefore training, the guidance classifier accuracy on the test set is {:.8f}.\n\n".format(
+                y_acc_aux_model))
+        else:
+            # LDL 逻辑：跳过计算，打印一条提示即可
+            logging.info("\n[LDL Task] Skipping initial accuracy check (Metric incompatibility).\n")
 
         optimizer = get_optimizer(self.config.optim, model.parameters())
         criterion = nn.CrossEntropyLoss()
@@ -199,7 +720,7 @@ class Diffusion(object):
             ema_helper = None
 
         if config.diffusion.apply_aux_cls:
-            if hasattr(config.diffusion, "trained_aux_cls_ckpt_path"):  # load saved auxiliary classifier
+            if hasattr(config.diffusion, "trained_aux_cls_ckpt_path") and config.diffusion.trained_aux_cls_ckpt_path:
                 aux_states = torch.load(os.path.join(config.diffusion.trained_aux_cls_ckpt_path,
                                                      config.diffusion.trained_aux_cls_ckpt_name),
                                         map_location=self.device)
@@ -218,6 +739,12 @@ class Diffusion(object):
                     for feature_label_set in train_loader:
                         if config.data.dataset == "gaussian_mixture":
                             x_batch, y_one_hot_batch, y_logits_batch, y_labels_batch = feature_label_set
+                        # [新增] LDL 分支：直接读取，不做 One-hot 转换
+                        elif config.data.dataset in self.ldl_datasets:
+                            x_batch, y_labels_batch = feature_label_set
+                                # 这一步很关键：直接把真实的分布标签赋值给 y_one_hot_batch
+                            y_one_hot_batch = y_labels_batch.to(self.device)
+                            y_logits_batch = None # LDL 不需要这个
                         else:
                             x_batch, y_labels_batch = feature_label_set
                             y_one_hot_batch, y_logits_batch = cast_label_to_one_hot_and_prototype(y_labels_batch,
@@ -239,12 +766,13 @@ class Diffusion(object):
                 ]
                 torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
             # report accuracy on both training and test set for the pre-trained auxiliary classifier
-            y_acc_aux_model = self.evaluate_guidance_model(train_loader)
-            logging.info("\nAfter pre-training, guidance classifier accuracy on the training set is {:.8f}.".format(
-                y_acc_aux_model))
-            y_acc_aux_model = self.evaluate_guidance_model(test_loader)
-            logging.info("\nAfter pre-training, guidance classifier accuracy on the test set is {:.8f}.\n".format(
-                y_acc_aux_model))
+            if config.data.dataset not in self.ldl_datasets:
+                y_acc_aux_model = self.evaluate_guidance_model(train_loader)
+                logging.info("\nAfter pre-training, accuracy on training set: {:.8f}.".format(y_acc_aux_model))
+                y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+                logging.info("\nAfter pre-training, accuracy on test set: {:.8f}.\n".format(y_acc_aux_model))
+            else:
+                logging.info("\n[LDL Task] Pre-training finished. Skipping accuracy report.\n")
 
         if not self.args.train_guidance_only:
             start_epoch, step = 0, 0
@@ -260,25 +788,32 @@ class Diffusion(object):
                 if self.config.model.ema:
                     ema_helper.load_state_dict(states[4])
                 # load auxiliary model
-                if config.diffusion.apply_aux_cls and (
-                        hasattr(config.diffusion, "trained_aux_cls_ckpt_path") is False) and (
-                        hasattr(config.diffusion, "trained_aux_cls_log_path") is False):
+                has_ckpt = hasattr(config.diffusion, "trained_aux_cls_ckpt_path") and config.diffusion.trained_aux_cls_ckpt_path
+                has_log = hasattr(config.diffusion, "trained_aux_cls_log_path") and config.diffusion.trained_aux_cls_log_path
+                
+                if config.diffusion.apply_aux_cls and (not has_ckpt) and (not has_log):
                     aux_states = torch.load(os.path.join(self.args.log_path, "aux_ckpt.pth"),
                                             map_location=self.device)
                     self.cond_pred_model.load_state_dict(aux_states[0])
                     aux_optimizer.load_state_dict(aux_states[1])
 
             max_accuracy = 0.0
+            best_avg_imp = -float('inf')
             if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
                 logging.info("Prior distribution at timestep T has a mean of 0.")
             if args.add_ce_loss:
                 logging.info("Apply cross entropy as an auxiliary loss during training.")
+            loss_history = []
             for epoch in range(start_epoch, self.config.training.n_epochs):
                 data_start = time.time()
                 data_time = 0
                 for i, feature_label_set in enumerate(train_loader):
                     if config.data.dataset == "gaussian_mixture":
                         x_batch, y_one_hot_batch, y_logits_batch, y_labels_batch = feature_label_set
+                    elif config.data.dataset in self.ldl_datasets:
+                        x_batch, y_labels_batch = feature_label_set
+                        y_one_hot_batch = y_labels_batch.to(self.device) # 分布本身就是目标
+                        y_logits_batch = None # 不需要 Logits
                     else:
                         x_batch, y_labels_batch = feature_label_set
                         y_one_hot_batch, y_logits_batch = cast_label_to_one_hot_and_prototype(y_labels_batch, config)
@@ -304,7 +839,10 @@ class Diffusion(object):
                     # noise estimation loss
                     x_batch = x_batch.to(self.device)
                     # y_0_batch = y_logits_batch.to(self.device)
-                    y_0_hat_batch = self.compute_guiding_prediction(x_unflat_batch).softmax(dim=1)
+                    if config.data.dataset in self.ldl_datasets:
+                        y_0_hat_batch = self.compute_guiding_prediction(x_unflat_batch)
+                    else:
+                        y_0_hat_batch = self.compute_guiding_prediction(x_unflat_batch).softmax(dim=1)
                     y_T_mean = y_0_hat_batch
                     if config.diffusion.noise_prior:  # apply 0 instead of f_phi(x) as prior mean
                         y_T_mean = torch.zeros(y_0_hat_batch.shape).to(y_0_hat_batch.device)
@@ -393,7 +931,7 @@ class Diffusion(object):
                             torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
 
                     data_start = time.time()
-
+                loss_history.append(loss.item())
                 logging.info(
                     (f"epoch: {epoch}, step: {step}, CE loss: {loss0.item()}, Noise Estimation loss: {loss.item()}, " +
                      f"data time: {data_time / (i + 1)}")
@@ -402,7 +940,31 @@ class Diffusion(object):
                 # Evaluate
                 if epoch % self.config.training.validation_freq == 0 \
                         or epoch + 1 == self.config.training.n_epochs:
-                    if config.data.dataset == "toy":
+                    if config.data.dataset in self.ldl_datasets:
+                        # 验证阶段只跑 1 次，为了快
+                        current_scores = self.test_ldl_task(model, test_loader, n_repeat=1)
+                        current_imp = calc_avg_improvement(current_scores, self.sota_values)
+                        
+                        logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.4f}")
+                        
+                        if current_imp > best_avg_imp:
+                            best_avg_imp = current_imp
+                            # 构建保存路径: model/数据集/run_X/
+                            run_idx = getattr(config.data, "run_idx", 0)
+                            save_dir = os.path.join(self.model_save_root, config.data.dataset, f'run_{run_idx}')
+                            os.makedirs(save_dir, exist_ok=True)
+                            
+                            # 保存 Best 模型
+                            states = [model.state_dict(), optimizer.state_dict(), epoch, step]
+                            torch.save(states, os.path.join(save_dir, "ckpt_best.pth"))
+                            
+                            # 保存辅助模型
+                            if config.diffusion.apply_aux_cls:
+                                aux_states = [self.cond_pred_model.state_dict(), aux_optimizer.state_dict()]
+                                torch.save(aux_states, os.path.join(save_dir, "aux_best.pth"))
+                                
+                            logging.info(f"💾 Saved Best Model to: {save_dir}")
+                    elif config.data.dataset == "toy":
                         with torch.no_grad():
                             model.eval()
                             label_vec = nn.functional.one_hot(test_dataset[:][1]).float().to(self.device)
@@ -513,14 +1075,65 @@ class Diffusion(object):
                 ]
                 torch.save(aux_states, os.path.join(self.args.log_path, "aux_ckpt.pth"))
                 # report training set accuracy if applied joint training
-                y_acc_aux_model = self.evaluate_guidance_model(train_loader)
-                logging.info("After joint-training, guidance classifier accuracy on the training set is {:.8f}.".format(
-                    y_acc_aux_model))
-                # report test set accuracy if applied joint training
-                y_acc_aux_model = self.evaluate_guidance_model(test_loader)
-                logging.info("After joint-training, guidance classifier accuracy on the test set is {:.8f}.".format(
-                    y_acc_aux_model))
+                if config.data.dataset not in self.ldl_datasets:
+                    y_acc_aux_model = self.evaluate_guidance_model(train_loader)
+                    logging.info("After joint-training, acc: {:.8f}.".format(y_acc_aux_model))
+                    y_acc_aux_model = self.evaluate_guidance_model(test_loader)
+                    logging.info("After joint-training, test acc: {:.8f}.".format(y_acc_aux_model))
+            final_ensemble_imp = best_avg_imp 
+            try:
+                curve_dir = "curve"
+                os.makedirs(curve_dir, exist_ok=True)
+                
+                # 构建文件名：数据集_RunID_时间戳.png
+                run_idx = getattr(config.data, "run_idx", 0)
+                timestamp = int(time.time())
+                plot_path = os.path.join(curve_dir, f"{config.data.dataset}_run{run_idx}_loss.png")
+                
+                plt.figure(figsize=(10, 6))
+                plt.plot(loss_history, label='Training Loss')
+                plt.title(f'Training Loss Curve - {config.data.dataset} (Run {run_idx})')
+                plt.xlabel('Epochs')
+                plt.ylabel('Loss')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(plot_path)
+                plt.close() # 关闭画布释放内存
+                logging.info(f" Training Loss curve saved to: {plot_path}")
+            except Exception as e:
+                logging.warning(f"Failed to plot loss curve: {e}")
+            # ====================================================================
+            if config.data.dataset in self.ldl_datasets:
+                logging.info("\n>>> Training Finished. Loading Best Model for Final Ensemble Test...")
+                
+                run_idx = getattr(config.data, "run_idx", 0)
+                save_dir = os.path.join(self.model_save_root, config.data.dataset, f'run_{run_idx}')
+                best_ckpt_path = os.path.join(save_dir, "ckpt_best.pth")
+                
+                if os.path.exists(best_ckpt_path):
+                    states = torch.load(best_ckpt_path, map_location=self.device)
+                    model.load_state_dict(states[0])
+                    logging.info("Loaded diffusion model.")
+                    
+                    if config.diffusion.apply_aux_cls:
+                        aux_path = os.path.join(save_dir, "aux_best.pth")
+                        if os.path.exists(aux_path):
+                            aux_states = torch.load(aux_path, map_location=self.device)
+                            self.cond_pred_model.load_state_dict(aux_states[0])
+                    final_scores = self.test_ldl_task(model, test_loader, n_repeat=10)
+                    final_ensemble_imp = calc_avg_improvement(final_scores, self.sota_values)
+                else:
+                    logging.error(f"Best checkpoint not found at {best_ckpt_path}, skipping final test.")
+                    
+        # 4. 打印对比日志
+        logging.info("\n" + "="*50)
+        logging.info(f"🔹 Best Single-Shot (Training Phase) : {best_avg_imp:.4f}") 
+        logging.info(f"🔹 Final Ensemble  (Testing Phase)  : {final_ensemble_imp:.4f}") 
+        logging.info("=" * 50 + "\n")
 
+        # 5. 返回正确的值给 main.py
+        return final_scores
+        
     def test_image_task(self):
         """
         Evaluate model performance on image classification tasks.
@@ -880,11 +1493,12 @@ class Diffusion(object):
 
         # load auxiliary model
         if config.diffusion.apply_aux_cls:
-            if hasattr(config.diffusion, "trained_aux_cls_ckpt_path"):
+            if hasattr(config.diffusion, "trained_aux_cls_ckpt_path") and config.diffusion.trained_aux_cls_ckpt_path:
                 aux_states = torch.load(os.path.join(config.diffusion.trained_aux_cls_ckpt_path,
                                                      config.diffusion.trained_aux_cls_ckpt_name),
                                         map_location=self.device)
                 self.cond_pred_model.load_state_dict(aux_states['state_dict'], strict=True)
+                self.cond_pred_model.eval()
             else:
                 aux_cls_path = log_path
                 if hasattr(config.diffusion, "trained_aux_cls_log_path"):
@@ -1167,3 +1781,83 @@ class Diffusion(object):
         gc.collect()
 
         return y_majority_vote_accuracy_all_steps_list
+    
+    def test_ldl_task(self, model, test_loader, n_repeat=10):
+        """
+        [逻辑修正版] 
+        遇到 NaN 不是填假数据，而是【重新采样】，保证数据的真实性。
+        """
+        model.eval()
+        self.cond_pred_model.eval()
+        
+        all_targets = []
+        all_sample_preds = [] 
+        
+        for _ in range(n_repeat):
+            all_sample_preds.append([])
+
+        with torch.no_grad():
+            # 1. 收集真实标签
+            for _, y_true in test_loader:
+                all_targets.append(y_true.numpy())
+            Y_true = np.concatenate(all_targets, axis=0)
+
+            # 2. 循环推理 n_repeat 次
+            iter_range = range(n_repeat)
+            if n_repeat > 1:
+                logging.info(f"Running Ensemble Test ({n_repeat} rounds)...")
+
+            for i in iter_range:
+                for x_batch, _ in test_loader:
+                    x_batch = x_batch.to(self.device)
+                    
+                    # Guidance
+                    y_0_hat = self.compute_guiding_prediction(x_batch)
+                    
+                    # Diffusion Sampling
+                    y_T_mean = y_0_hat
+                    if self.config.diffusion.noise_prior:
+                        y_T_mean = torch.zeros_like(y_0_hat)
+                    max_retries = 20 
+                    success = False
+                    for attempt in range(max_retries):
+                        # 采样
+                        y_gen_seq = p_sample_loop(
+                            model, x_batch, y_0_hat, y_T_mean, 
+                            self.num_timesteps, self.alphas, 
+                            self.one_minus_alphas_bar_sqrt, only_last_sample=True
+                        )
+                        # 检查结果是否有效
+                        if isinstance(y_gen_seq, list): 
+                            y_check = y_gen_seq[0]
+                        else:
+                            y_check = y_gen_seq
+                        # 如果没有 NaN 且没有 Inf，视为成功
+                        if not (torch.isnan(y_check).any() or torch.isinf(y_check).any()):
+                            if isinstance(y_gen_seq, list): y_gen_seq = y_gen_seq[0]
+                            all_sample_preds[i].append(y_gen_seq.cpu().numpy())
+                            success = True
+                            break # 跳出重试循环，继续下一个 batch
+                        else:
+                            logging.warning(f"⚠️ NaN detected in Round {i}, Batch attempt {attempt+1}/{max_retries}. Resampling...")
+                    if not success:
+                        raise ValueError(f"❌ Error: Model output NaN for {max_retries} consecutive attempts. Training Diverged.")
+                    # =================================================================
+        full_preds_per_repeat = []
+        for i in range(n_repeat):
+            full_preds_per_repeat.append(np.concatenate(all_sample_preds[i], axis=0))
+        
+        stacked_preds = np.stack(full_preds_per_repeat, axis=0) # (n_repeat, n_samples, n_classes)
+        Y_hat_avg = np.mean(stacked_preds, axis=0)
+        Y_hat = metrics.proj(Y_hat_avg)
+        scores = metrics.score(Y_true, Y_hat)
+        if n_repeat > 1:
+            logging.info("\n" + "="*60)
+            logging.info(f"FINAL ENSEMBLE RESULT ({n_repeat} rounds) | Dataset: {self.config.data.dataset}")
+            logging.info("-" * 60)
+            metrics_keys = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
+            for i, name in enumerate(metrics_keys):
+                logging.info(f"{name:<10} | {scores[i]:.4f}")
+            logging.info("="*60 + "\n")
+
+        return scores
