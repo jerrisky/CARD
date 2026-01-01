@@ -329,7 +329,7 @@ class Diffusion(object):
                                 f"epoch: {epoch}, guidance auxiliary classifier pre-training loss: {aux_loss}"
                             )
                     pretrain_end_time = time.time()
-                    logging.info("\nPre-training of guidance auxiliary classifier took {:.4f} minutes.\n".format(
+                    logging.info("\nPre-training of guidance auxiliary classifier took {:.8f} minutes.\n".format(
                         (pretrain_end_time - pretrain_start_time) / 60))
                     # save auxiliary model after pre-training
                     aux_states = [
@@ -516,7 +516,7 @@ class Diffusion(object):
                             current_scores = self.test_ldl_task(model, test_loader, n_repeat=1)
                             current_imp = calc_avg_improvement(current_scores, self.sota_values)
                             
-                            logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.4f}")
+                            logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.8f}")
                             
                             if current_imp > best_avg_imp:
                                 best_avg_imp = current_imp
@@ -757,7 +757,7 @@ class Diffusion(object):
                             f"epoch: {epoch}, guidance auxiliary classifier pre-training loss: {aux_loss}"
                         )
                 pretrain_end_time = time.time()
-                logging.info("\nPre-training of guidance auxiliary classifier took {:.4f} minutes.\n".format(
+                logging.info("\nPre-training of guidance auxiliary classifier took {:.8f} minutes.\n".format(
                     (pretrain_end_time - pretrain_start_time) / 60))
                 # save auxiliary model after pre-training
                 aux_states = [
@@ -945,7 +945,7 @@ class Diffusion(object):
                         current_scores = self.test_ldl_task(model, test_loader, n_repeat=1)
                         current_imp = calc_avg_improvement(current_scores, self.sota_values)
                         
-                        logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.4f}")
+                        logging.info(f"Ep: {epoch}, AvgImp: {current_imp:.2%}, KL: {current_scores[3]:.8f}")
                         
                         if current_imp > best_avg_imp:
                             best_avg_imp = current_imp
@@ -1127,8 +1127,8 @@ class Diffusion(object):
                     
         # 4. 打印对比日志
         logging.info("\n" + "="*50)
-        logging.info(f"🔹 Best Single-Shot (Training Phase) : {best_avg_imp:.4f}") 
-        logging.info(f"🔹 Final Ensemble  (Testing Phase)  : {final_ensemble_imp:.4f}") 
+        logging.info(f"🔹 Best Single-Shot (Training Phase) : {best_avg_imp:.8f}") 
+        logging.info(f"🔹 Final Ensemble  (Testing Phase)  : {final_ensemble_imp:.8f}") 
         logging.info("=" * 50 + "\n")
 
         # 5. 返回正确的值给 main.py
@@ -1303,7 +1303,7 @@ class Diffusion(object):
                 # logging.info(pred_by_narrowest_CI_width)  #@#
                 narrowest_CI_pred_correctness = (pred_by_narrowest_CI_width == true_y_label)  # (n_test, )
                 logging.info(("We predict the label by the class with the {}-th narrowest CI width, \n" +
-                              "and obtain a test accuracy of {:.4f}% through the entire test set.").format(
+                              "and obtain a test accuracy of {:.8f}% through the entire test set.").format(
                     kth_smallest, np.mean(narrowest_CI_pred_correctness) * 100))
             # check whether the most predicted class is the correct label for each x
             majority_vote_correctness = (majority_voted_class == true_y_label)  # (n_test, )
@@ -1319,12 +1319,12 @@ class Diffusion(object):
                               "for test instances with index {}.").format(nan_idx.numpy()))
             CI_width_true_class_correct_pred = CI_width_true_class[majority_vote_correctness]  # (n_correct, 1)
             CI_width_true_class_incorrect_pred = CI_width_true_class[~majority_vote_correctness]  # (n_incorrect, 1)
-            logging.info(("\n\nWe apply the majority-voted class label as our prediction, and achieve {:.4f}% " +
+            logging.info(("\n\nWe apply the majority-voted class label as our prediction, and achieve {:.8f}% " +
                           "accuracy through the entire test set.\n" +
                           "Out of {} test instances, we made {} correct predictions, with a " +
-                          "mean credible interval width of {:.4f} in predicted probability of the true class; \n" +
+                          "mean credible interval width of {:.8f} in predicted probability of the true class; \n" +
                           "the remaining {} instances are classified incorrectly, " +
-                          "with a mean CI width of {:.4f}.\n").format(
+                          "with a mean CI width of {:.8f}.\n").format(
                 np.mean(majority_vote_correctness) * 100,
                 true_y_label.shape[0],
                 majority_vote_correctness.sum(),
@@ -1341,9 +1341,9 @@ class Diffusion(object):
                 CI_width_true_class_c = CI_width_true_class[true_y_label == c]  # (n_class_c, 1)
                 CI_w_cor_class_c = CI_width_true_class_c[maj_vote_cor_class_c]  # (n_correct_class_c, 1)
                 CI_w_incor_class_c = CI_width_true_class_c[~maj_vote_cor_class_c]  # (n_incorrect_class_c, 1)
-                logging.info(("\n\tClass {} ({} total instances, {:.4f}% accuracy):" +
-                              "\n\t\t{} correct predictions, mean CI width {:.4f}" +
-                              "\n\t\t{} incorrect predictions, mean CI width {:.4f}").format(
+                logging.info(("\n\tClass {} ({} total instances, {:.8f}% accuracy):" +
+                              "\n\t\t{} correct predictions, mean CI width {:.8f}" +
+                              "\n\t\t{} incorrect predictions, mean CI width {:.8f}").format(
                     c, maj_vote_cor_class_c.shape[0], np.mean(maj_vote_cor_class_c) * 100,
                     CI_w_cor_class_c.shape[0], CI_w_cor_class_c.mean().item(),
                     CI_w_incor_class_c.shape[0], CI_w_incor_class_c.mean().item()))
@@ -1368,12 +1368,12 @@ class Diffusion(object):
             # split test instances into correct and incorrect predictions
             ttest_reject_correct_pred = ttest_reject[majority_vote_correctness]  # (n_correct, )
             ttest_reject_incorrect_pred = ttest_reject[~majority_vote_correctness]  # (n_incorrect, )
-            logging.info(("\n\nWe apply the majority-voted class label as our prediction, and achieve {:.4f}% " +
+            logging.info(("\n\nWe apply the majority-voted class label as our prediction, and achieve {:.8f}% " +
                           "accuracy through the entire test set.\n" +
                           "Out of {} test instances, we made {} correct predictions, with a " +
-                          "mean rejection rate of {:.4f}% for the paired two-sided t-test; \n" +
+                          "mean rejection rate of {:.8f}% for the paired two-sided t-test; \n" +
                           "the remaining {} instances are classified incorrectly, " +
-                          "with a mean rejection rate of {:.4f}%.\n").format(
+                          "with a mean rejection rate of {:.8f}%.\n").format(
                 np.mean(majority_vote_correctness) * 100,
                 true_y_label.shape[0],
                 ttest_reject_correct_pred.shape[0],
@@ -1390,9 +1390,9 @@ class Diffusion(object):
                 ttest_reject_class_c = ttest_reject[true_y_label == c]  # (n_class_c, 1)
                 ttest_rej_cor_class_c = ttest_reject_class_c[maj_vote_cor_class_c]  # (n_correct_class_c, 1)
                 ttest_rej_incor_class_c = ttest_reject_class_c[~maj_vote_cor_class_c]  # (n_incorrect_class_c, 1)
-                logging.info(("\n\tClass {} ({} total instances, {:.4f}% accuracy):" +
-                              "\n\t\t{} correct predictions, mean rejection rate {:.4f}%" +
-                              "\n\t\t{} incorrect predictions, mean rejection rate {:.4f}%").format(
+                logging.info(("\n\tClass {} ({} total instances, {:.8f}% accuracy):" +
+                              "\n\t\t{} correct predictions, mean rejection rate {:.8f}%" +
+                              "\n\t\t{} incorrect predictions, mean rejection rate {:.8f}%").format(
                     c, maj_vote_cor_class_c.shape[0], np.mean(maj_vote_cor_class_c) * 100,
                     ttest_rej_cor_class_c.shape[0], ttest_rej_cor_class_c.mean().item() * 100,
                     ttest_rej_incor_class_c.shape[0], ttest_rej_incor_class_c.mean().item() * 100))
@@ -1405,9 +1405,9 @@ class Diffusion(object):
             maj_vote_cor_not_reject = majority_vote_correctness[~ttest_reject]  # (n_not_reject, )
             logging.info(("\n\nFurthermore, among all test instances, " +
                           "we reject {} t-tests, with a " +
-                          "mean accuracy of {:.4f}%; \n" +
+                          "mean accuracy of {:.8f}%; \n" +
                           "the remaining {} t-tests are not rejected, " +
-                          "with a mean accuracy of {:.4f}%.\n").format(
+                          "with a mean accuracy of {:.8f}%.\n").format(
                 maj_vote_cor_reject.shape[0],
                 maj_vote_cor_reject.mean().item() * 100,
                 maj_vote_cor_not_reject.shape[0],
@@ -1422,9 +1422,9 @@ class Diffusion(object):
                 ttest_reject_class_c = ttest_reject[true_y_label == c]  # (n_class_c, 1)
                 maj_vote_cor_rej_class_c = maj_vote_cor_class_c[ttest_reject_class_c]  # (n_rej_class_c, 1)
                 maj_vote_cor_not_rej_class_c = maj_vote_cor_class_c[~ttest_reject_class_c]  # (n_not_rej_class_c, 1)
-                logging.info(("\n\tClass {} ({} total instances, {:.4f}% rejection rate):" +
-                              "\n\t\t{} rejected t-tests, mean accuracy {:.4f}%" +
-                              "\n\t\t{} not-rejected t-tests, mean accuracy {:.4f}%").format(
+                logging.info(("\n\tClass {} ({} total instances, {:.8f}% rejection rate):" +
+                              "\n\t\t{} rejected t-tests, mean accuracy {:.8f}%" +
+                              "\n\t\t{} not-rejected t-tests, mean accuracy {:.8f}%").format(
                     c, ttest_reject_class_c.shape[0], np.mean(ttest_reject_class_c) * 100,
                     maj_vote_cor_rej_class_c.shape[0], maj_vote_cor_rej_class_c.mean().item() * 100,
                     maj_vote_cor_not_rej_class_c.shape[0], maj_vote_cor_not_rej_class_c.mean().item() * 100))
@@ -1554,7 +1554,7 @@ class Diffusion(object):
                                                             n_tune_T_samples,
                                                             config.data.num_classes).mean(1)  # (batch_size, n_classes)
                 minibatch_sample_end = time.time()
-                logging.info("Minibatch {} sampling took {:.4f} seconds.".format(
+                logging.info("Minibatch {} sampling took {:.8f} seconds.".format(
                     idx, (minibatch_sample_end - minibatch_sample_start)))
                 y_0_one_sample_all.append(y_0_sample_batch.detach())
                 # only generate a few batches for sanity checking
@@ -1595,7 +1595,7 @@ class Diffusion(object):
             T_description = "tuned"
         else:
             self.tuned_scale_T = 1
-        logging.info("Apply {} temperature scaling parameter T with a value of {:.4f}".format(
+        logging.info("Apply {} temperature scaling parameter T with a value of {:.8f}".format(
             T_description, self.tuned_scale_T))
 
         with torch.no_grad():
@@ -1664,7 +1664,7 @@ class Diffusion(object):
             y_majority_vote_accuracy = np.mean(majority_vote_correctness)
             y_majority_vote_accuracy_all_steps_list.append(y_majority_vote_accuracy)
         instance_accuracy_t = instance_accuracy_by_batch_list[config.testing.metrics_t]
-        logging.info("Mean accuracy of all samples at test instance level is {:.4f}%.\n".format(
+        logging.info("Mean accuracy of all samples at test instance level is {:.8f}%.\n".format(
             np.mean(instance_accuracy_t) * 100))
         logging.info("\nNow we compute metrics related to predicted probability quantiles for all classes...")
         CI_all_classes_t = CI_by_batch_list[config.testing.metrics_t]  # (n_test, 2, n_classes)
@@ -1696,7 +1696,7 @@ class Diffusion(object):
         logging.info("\n\tCount of accurate and uncertain: {}".format(n_au))
         logging.info("\n\tCount of inaccurate and certain: {}".format(n_ic))
         logging.info("\n\tCount of inaccurate and uncertain: {}".format(n_iu))
-        logging.info(("\nWe obtain a PAvPU of {:.8f} with an alpha level of {:.4f} " +
+        logging.info(("\nWe obtain a PAvPU of {:.8f} with an alpha level of {:.8f} " +
                       "for the test set with size {}\n\n").format(
             PAvPU, config.testing.ttest_alpha, majority_vote_correctness.shape[0]))
 
@@ -1857,7 +1857,7 @@ class Diffusion(object):
             logging.info("-" * 60)
             metrics_keys = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
             for i, name in enumerate(metrics_keys):
-                logging.info(f"{name:<10} | {scores[i]:.4f}")
+                logging.info(f"{name:<10} | {scores[i]:.8f}")
             logging.info("="*60 + "\n")
 
         return scores
