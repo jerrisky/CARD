@@ -244,7 +244,7 @@ class Diffusion(object):
         config.model.data_dim = real_data_dim
         config.data.num_classes = real_num_classes
         
-        logging.info(f"Dataset Loaded. Samples: {train_size}. Feature Dim: {real_data_dim}")
+        logging.info(f"Dataset Loaded. Samples: {train_size}. data_dim: {real_data_dim}")
         for fold, (train_ids, val_ids) in enumerate(kfold.split(full_train_dataset)):
             logging.info(f"\n--- Tuning Fold {fold+1} / 5 ---")
             # (A) 准备数据 (切分)
@@ -629,7 +629,7 @@ class Diffusion(object):
                         y_acc_aux_model = self.evaluate_guidance_model(test_loader)
                         logging.info("After joint-training, test acc: {:.8f}.".format(y_acc_aux_model))
                 final_ensemble_imp = best_avg_imp 
-            logging.info(f"Fold {fold+1} Finished. Best Imp: {best_avg_imp:.2%}")
+            logging.info(f"Fold {fold+1} Finished. Best Imp: {final_ensemble_imp:.2%}")
             fold_imps.append(final_ensemble_imp)
         avg_imp = np.mean(fold_imps)
         print(f"[SEARCH_RESULT_START]")

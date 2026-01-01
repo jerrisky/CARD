@@ -19,10 +19,10 @@ CONFIG_DIR = "configs"
 
 # 搜索空间
 SEARCH_SPACE = {
-    "lr": [1e-3, 5e-4],
-    "batch_size": [128],
-    "hidden_dim": [512],
-    "feature_dim": [256, 512]
+    "lr": [1e-3, 5e-4, 1e-4],
+    "batch_size": [64, 128],
+    "hidden_dim": [256, 512],
+    "feature_dim": [64,256, 512,1024]
 }
 
 METRICS_KEYS = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
@@ -54,9 +54,9 @@ def update_config(dataset, params, run_idx, is_search=False):
 
     # 3. Epoch 控制
     if is_search:
-        config.setdefault('training', {})['n_epochs'] = 150
+        config.setdefault('training', {})['n_epochs'] = 200
     else:
-        config.setdefault('training', {})['n_epochs'] = 2500
+        config.setdefault('training', {})['n_epochs'] = 3000
 
     # 4. 生成临时文件
     prefix = "search" if is_search else "eval"
@@ -72,41 +72,37 @@ def run_task(dataset, params, run_idx, device, is_search_phase=False):
     # 1. 生成配置
     config_path = update_config(dataset, params, run_idx, is_search_phase)
     
-    # 2. 确定路径
+    # 2. 确定路径和文档名
     if is_search_phase:
-        model_save_dir = TEMP_MODEL_ROOT
-        doc_name = f"search_{run_idx}"
+        model_save_dir = TEMP_MODEL_ROOT 
+        doc_name = f"search/search_{run_idx}" 
     else:
         model_save_dir = MODEL_ROOT
         doc_name = f"run_{run_idx}"
-
-    os.makedirs(os.path.join(RESULT_ROOT, dataset, "search_logs" if is_search_phase else f"run_{run_idx}"), exist_ok=True)
 
     # 3. 构造命令参数列表
     cmd_args = [
         "--config", config_path,
         "--doc", doc_name,
-        "--exp", "result", 
+        "--exp", os.path.join(RESULT_ROOT, dataset), 
         "--device", str(device),
         "--loss", "card_onehot_conditional",
         "--model_dir", model_save_dir,
         "--split", str(run_idx),
-        "--ni",              # No interaction
+        "--ni",              
         "--verbose", "info"
     ]
     
-    # 如果是搜索阶段，加入 --tune 开关
     if is_search_phase:
         cmd_args.append("--tune")
         
     print(f"🚀 Running: {doc_name} | Params: {params}")
 
     try:
-        # 【核心修复】必须用 main.py 的解析器，把 cmd_args 列表转换成 args 对象！
-        # 这样 args 才会包含 --exp, --seed 等所有参数的默认值
+        # 解析参数
         task_args = main_script.parser.parse_args(cmd_args)
         
-        # 5. 调用 main 函数，传入刚才转换好的 task_args
+        # 4. 调用 main 函数
         result = main_script.main(task_args) 
         
     except Exception as e:
@@ -115,10 +111,11 @@ def run_task(dataset, params, run_idx, device, is_search_phase=False):
         traceback.print_exc()
         result = None
 
-    # 6. 清理
+    # 5. 清理临时配置文件
     if os.path.exists(config_path):
         os.remove(config_path)
     
+    # 清理搜索阶段产生的临时模型文件 (temp_model_search 文件夹)
     if is_search_phase:
         temp_run_dir = os.path.join(TEMP_MODEL_ROOT, dataset, f"run_0")
         if os.path.exists(temp_run_dir):
@@ -134,7 +131,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- Phase 1: Grid Search ---
-    print(f"\n🔍 Phase 1: Search (Metric: AvgImp, Epochs: 150)...")
+    print(f"\n🔍 Phase 1: Search (Metric: AvgImp, Epochs: 200)...")
     keys, values = zip(*SEARCH_SPACE.items())
     combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
     
@@ -145,7 +142,7 @@ if __name__ == "__main__":
         avg_imp = run_task(args.dataset, params, i, args.device, is_search_phase=True)
         
         # 过滤无效结果
-        if avg_imp is not None and isinstance(avg_imp, float) and avg_imp > -900:
+        if avg_imp is not None and isinstance(avg_imp, float):
             print(f"👉 Trial {i}: AvgImp = {avg_imp:.4%}")
             search_results.append({
                 "params": params,
@@ -168,7 +165,7 @@ if __name__ == "__main__":
     print(f"🏆 Best Params: {best_params} (Imp: {best_record['imp']:.4%})")
 
     # --- Phase 2: Evaluation ---
-    print(f"\n🏃 Phase 2: Running 10-Fold Evaluation (Epochs=2500)...")
+    print(f"\n🏃 Phase 2: Running 10-Fold Evaluation (Epochs=3000)...")
     
     all_results = []
     summary_txt_path = os.path.join(RESULT_ROOT, args.dataset, "result.txt")
